@@ -6,6 +6,7 @@
 """
 import logging
 import torch
+import copy
 import torch.nn as nn
 from torch.cuda.amp import autocast as autocast
 from torch.nn import functional as F
@@ -21,6 +22,8 @@ from lavis.models.blip2_models.blip2 import (
 from model.blip2 import Blip2Base
 from transformers import AutoTokenizer
 from transformers import OPTForCausalLM
+from typing import Tuple, Dict, Union, List, Literal, Any, Optional
+from torch.nn import CrossEntropyLoss
 # from opendelta import LoraModel
 # from opendelta.delta_models.lora import LoraConfig
 # from opendelta.delta_configs
@@ -100,6 +103,28 @@ def smiles_handler(text, mol_ph):
     text = escape_custom_split_sequence(text)
     return text, smiles_list
 
+def pad_tensor_to_length(tensor: torch.Tensor, target_length, padding_value = -100, dim: int = -1):
+    if tensor.size(dim) >= target_length:
+        return tensor
+    else:
+        pad_size = list(tensor.shape)
+        pad_size[dim] = target_length - tensor.size(dim)
+        return torch.cat(
+            [
+                tensor,
+                padding_value * torch.ones(*pad_size, dtype=tensor.dtype, device=tensor.device),
+            ],
+            dim = dim,
+        )
+
+def clone_and_freeze(model):
+    clone_model = copy.deepcopy(model)
+    for _, param in clone_model.named_parameters():
+        param.requires_grad = False
+    clone_model = clone_model.eval()
+    clone_model.train = disabled_train
+    return clone_model
+
 
 class Blip2OPT(Blip2Base):
     """
@@ -129,6 +154,8 @@ class Blip2OPT(Blip2Base):
     ):
         super().__init__()
         self.args = args
+        self.beta = 1
+        self.label_smoothing = 0.1
 
         self.graph_encoder, self.ln_graph = self.init_graph_encoder(gin_num_layers, gin_hidden_dim, gin_drop_ratio)
         self.tune_gnn = tune_gnn
@@ -200,50 +227,94 @@ class Blip2OPT(Blip2Base):
         self.prompt = prompt
         # prompt_tokens = self.opt_tokenizer(self.prompt, return_tensors="pt")
         # self.prompt_length = prompt_tokens.attention_mask.sum(1)
+    def clone_model(self):
+        self.graph_encoder_clone = clone_and_freeze(self.graph_encoder)
+        self.ln_graph_clone = clone_and_freeze(self.ln_graph)
+        self.Qformer_clone = clone_and_freeze(self.Qformer)
+        self.opt_model_clone = clone_and_freeze(self.opt_model)
+        self.opt_proj_clone = clone_and_freeze(self.opt_proj)
 
-    def forward_old(self, batch):
-        graphs, text_tokens, prompt_lens = batch
-        graph_embeds, graph_masks = self.graph_encoder(graphs)
-        if not self.tune_gnn:
-            graph_embeds = graph_embeds.detach()
-        graph_embeds = self.ln_graph(graph_embeds, graph_masks)
-        device = graph_embeds.device
-        query_tokens = self.query_tokens.expand(graph_embeds.shape[0], -1, -1)
-        query_output = self.Qformer.bert(
-            query_embeds=query_tokens,
-            encoder_hidden_states=graph_embeds,
-            encoder_attention_mask=graph_masks, # fixme: check whether this mask is correct
-            return_dict=True,
-        )
-        inputs_opt = self.opt_proj(query_output.last_hidden_state)
-        atts_opt = torch.ones(inputs_opt.size()[:-1], dtype=torch.long).to(device)
-        targets = text_tokens.input_ids.masked_fill(
-            text_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
-        )
-        if self.prompt:
-            targets = mask_by_len(targets, prompt_lens, -100) # do not apply loss to the prompt
-            # targets[:, : self.prompt_length] = -100  # do not apply loss to the prompt
-        
-        empty_targets = (
-            torch.ones(atts_opt.size(), dtype=torch.long).to(device).fill_(-100)
-        )
-        targets = torch.cat([empty_targets, targets], dim=1)
-        
-        inputs_embeds = self.opt_model.get_input_embeddings()(text_tokens.input_ids)
-        inputs_embeds = torch.cat([inputs_opt, inputs_embeds], dim=1)
-        attention_mask = torch.cat([atts_opt, text_tokens.attention_mask], dim=1)
-        
-        outputs = self.opt_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            return_dict=True,
-            labels=targets,
-        )
-        loss = outputs.loss
-        return {"loss": loss}
     
-    def forward(self, batch):
-        graphs, prompt_tokens, text_tokens = batch
+    # def concatenated_inputs(self, batch):
+    #     print(batch[1][2].keys())
+    #     exit()
+    #     max_length = max(
+    #         max(batch[i][2].shape[1], batch[i][3]['input_ids'].shape[1])
+    #         for i in range(len(batch))
+    #     )
+
+    #     for i in range(len(batch)):
+    #         batch[i][2]['input_ids'] = pad_tensor_to_length(batch[i][2]['input_ids'], max_length, 1)
+    #         batch[i][3]['input_ids'] = pad_tensor_to_length(batch[i][2]['input_ids'], max_length, 1)
+    #         batch[i][2]['token_type_ids'] = pad_tensor_to_length(batch[i][2]['token_type_ids'], max_length, 0)
+    #         batch[i][3]['token_type_ids'] = pad_tensor_to_length(batch[i][3]['token_type_ids'], max_length, 0)
+    #         batch[i][2]['attention_mask'] = pad_tensor_to_length(batch[i][2]['attention_mask'], max_length, 0)
+    #         batch[i][3]['attention_mask'] = pad_tensor_to_length(batch[i][3]['attention_mask'], max_length, 0)
+
+    #     concatenated_batch = tuple(
+    #         {
+    #             key : torch.cat((batch[i][2][key], batch[i][3][key]), dim=1)
+    #             for key in batch[i][2].keys()
+    #         }
+    #         for i in range(len(batch))
+    #     )
+    #     for k in batch:
+    #         if k.startwith("real") and isinstance(batch[k], torch.Tensor):
+    #             concatenated_key = k.replace("real", "concatenated")
+    #             concatenated_batch[concatenated_key] = pad_tensor_to_length(batch[k], max_length, -100)
+    #     for k in batch:
+    #         if k.startwith("generated") and isinstance(batch[k], torch.Tensor):
+    #             concatenated_key = k.replace("generated", "concatenated")
+    #             concatenated_batch[concatenated_key] = pad_tensor_to_length(batch[k], max_length, -100)
+
+    #     return concatenated_batch, max_length
+
+    # def spin_loss(
+    #     self,
+    #     policy_real_logps: torch.FloatTensor,
+    #     policy_generated_logps: torch.FloatTensor,
+    #     opponent_real_lops: torch.FloatTensor,
+    #     opponent_generated_logps: torch.FloatTensor,
+    #     reference_free: bool = False,
+    #     ) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+
+    #     pi_logratios = policy_real_logps - policy_generated_logps
+    #     ref_logratios = opponent_real_lops - opponent_generated_logps
+
+    #     if reference_free:
+    #         ref_logratios = 0
+
+    #     logits = pi_logratios - ref_logratios
+    #     if self.loss_type == "sigmoid":
+    #     losses = -F.logsigmoid(self.beta * logits)
+    #     elif self.loss_type == "hinge":
+    #         losses = torch.relu(1 - self.beta * logits)
+    #     else:
+    #         raise ValueError(f"Unknown loss type: {self.loss_type}. Should be one of ['sigmoid', 'hinge']")
+        
+    #     real_rewards = self.beta * (policy_real_logps - opponent_real_lops).detach()
+    #     generated_rewards = self.beta * (policy_generated_logps - opponent_generated_logps).detach()
+
+
+    #     return losses, real_rewards, generated_rewards
+    
+    
+        # if logits.shape[:-1] != labels.shape:
+        #     raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+        
+        # loss_mask = labels != 0
+        # labels[labels == 0] = 0
+        # per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+
+        # if average_log_prob:
+        #     return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
+        # else:
+        #     return (per_token_logps * loss_mask).sum(-1)
+        
+
+    def get_now_forward(self, batch):
+        graphs, prompt_tokens, real_tokens, generated_tokens = batch
         graph_embeds, graph_masks = self.graph_encoder(graphs)
         if not self.tune_gnn:
             graph_embeds = graph_embeds.detach()
@@ -259,25 +330,188 @@ class Blip2OPT(Blip2Base):
         mol_tokens = self.opt_proj(query_output.last_hidden_state)
         
         empty_targets = torch.ones(prompt_tokens.attention_mask.shape, dtype=torch.long).to(device).fill_(-100)
-        targets = text_tokens.input_ids.masked_fill(
-            text_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
+        targets_real = real_tokens.input_ids.masked_fill(
+            real_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
         )
-        targets = torch.cat([empty_targets, targets], dim=1)
+        targets_real = torch.cat([empty_targets, targets_real], dim=1)
+        targets_generated = generated_tokens.input_ids.masked_fill(
+            generated_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
+        )
+        targets_generated = torch.cat([empty_targets, targets_generated], dim=1)
 
         prompt_embeds = self.opt_model.get_input_embeddings()(prompt_tokens.input_ids)
         prompt_embeds[prompt_tokens.is_mol_token] = mol_tokens.flatten(0, 1)
-        inputs_embeds = self.opt_model.get_input_embeddings()(text_tokens.input_ids)
-        inputs_embeds = torch.cat((prompt_embeds, inputs_embeds), dim=1)
-        attention_mask = torch.cat([prompt_tokens.attention_mask, text_tokens.attention_mask], dim=1)
+        inputs_embeds_real = self.opt_model.get_input_embeddings()(real_tokens.input_ids)
+        inputs_embeds_real = torch.cat((prompt_embeds, inputs_embeds_real), dim=1)
+        attention_mask_real = torch.cat([prompt_tokens.attention_mask, real_tokens.attention_mask], dim=1)
+        inputs_embeds_generated = self.opt_model.get_input_embeddings()(generated_tokens.input_ids)
+        inputs_embeds_generated = torch.cat((prompt_embeds, inputs_embeds_generated), dim=1)
+        attention_mask_generated = torch.cat([prompt_tokens.attention_mask, generated_tokens.attention_mask], dim=1)
         
-        outputs = self.opt_model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
+        outputs_real = self.opt_model(
+            inputs_embeds=inputs_embeds_real,
+            attention_mask=attention_mask_real,
             return_dict=True,
-            labels=targets,
+            labels=targets_real,
         )
-        loss = outputs.loss
-        return {"loss": loss}
+        outputs_generated = self.opt_model(
+            inputs_embeds=inputs_embeds_generated,
+            attention_mask=attention_mask_generated,
+            return_dict=True,
+            labels=targets_generated,
+        )
+
+        real_logits = outputs_real.logits
+        generated_logits = outputs_generated.logits
+
+        real_logps = self._get_batch_logps(
+            real_logits[:, :-1, :],
+            targets_real[:, 1:],
+            average_log_prob=False,
+        )
+        generated_logps = self._get_batch_logps(
+            generated_logits[:, :-1, :],
+            targets_generated[:, 1:],
+            average_log_prob=False,
+        )
+
+        # print(f"\nThe loss of the real outputs is {outputs_real.loss}, The loss computed manually is {real_logps}")
+        # print(f"The loss of the generated outputs is {outputs_generated.loss}, The loss computed manually is {generated_logps}")
+        # exit()
+
+        # for batch_idx in range(0,4):
+        #     print(f"\nThe token in batch{batch_idx} is")
+        #     logits_ids_real = torch.argmax(real_logits[:, prompt_embeds.size(1)-1: -1, :], dim=-1)
+        #     seq_len_real = logits_ids_real.size(1)
+        #     print("The real logits and labels are:")
+        #     print(f"{'Token Index':<12}{'Logits Token':<25}{'Labels Token':<25}{'Match'}")
+        #     print("=" * 70)
+        #     for idx in range(seq_len_real):
+        #         logits_token = self.opt_tokenizer.decode([logits_ids_real[batch_idx, idx].item()])
+        #         label_token = self.opt_tokenizer.decode([real_tokens.input_ids.clone()[batch_idx, idx].item()])
+        #         match = logits_token == label_token
+        #         print(f"{idx:<12}{logits_token:<25}{label_token:<25}{match}")
+                        
+        #     logits_ids_generated = torch.argmax(generated_logits[:, prompt_embeds.size(1)-1: -1, :], dim=-1)
+        #     seq_len_generated = logits_ids_generated.size(1)
+        #     print("The generated logits and labels are:")
+        #     print(f"{'Token Index':<12}{'Logits Token':<25}{'Labels Token':<25}{'Match'}")
+        #     print("=" * 70)
+        #     for idx in range(seq_len_generated):
+        #         logits_token = self.opt_tokenizer.decode([logits_ids_generated[batch_idx, idx].item()])
+        #         label_token = self.opt_tokenizer.decode([generated_tokens.input_ids.clone()[batch_idx, idx].item()])
+        #         match = logits_token == label_token
+        #         print(f"{idx:<12}{logits_token:<25}{label_token:<25}{match}")
+        # exit()
+
+        return real_logps, generated_logps
+    
+    def get_before_forward(self, batch):
+        graphs, prompt_tokens, real_tokens, generated_tokens = batch
+        graph_embeds, graph_masks = self.graph_encoder_clone(graphs)
+        if not self.tune_gnn:
+            graph_embeds = graph_embeds.detach()
+        graph_embeds = self.ln_graph_clone(graph_embeds, graph_masks)
+        device = graph_embeds.device
+        query_tokens = self.query_tokens.expand(graph_embeds.shape[0], -1, -1)
+        query_output = self.Qformer_clone.bert(
+            query_embeds=query_tokens,
+            encoder_hidden_states=graph_embeds,
+            encoder_attention_mask=graph_masks, # fixme: check whether this mask is correct
+            return_dict=True,
+        )
+        mol_tokens = self.opt_proj_clone(query_output.last_hidden_state)
+        
+        empty_targets = torch.ones(prompt_tokens.attention_mask.shape, dtype=torch.long).to(device).fill_(-100)
+        targets_real = real_tokens.input_ids.masked_fill(
+            real_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
+        )
+        targets_real = torch.cat([empty_targets, targets_real], dim=1)
+        targets_generated = generated_tokens.input_ids.masked_fill(
+            generated_tokens.input_ids == self.opt_tokenizer.pad_token_id, -100
+        )
+        targets_generated = torch.cat([empty_targets, targets_generated], dim=1)
+
+        prompt_embeds = self.opt_model_clone.get_input_embeddings()(prompt_tokens.input_ids)
+        prompt_embeds[prompt_tokens.is_mol_token] = mol_tokens.flatten(0, 1)
+        inputs_embeds_real = self.opt_model_clone.get_input_embeddings()(real_tokens.input_ids)
+        inputs_embeds_real = torch.cat((prompt_embeds, inputs_embeds_real), dim=1)
+        attention_mask_real = torch.cat([prompt_tokens.attention_mask, real_tokens.attention_mask], dim=1)
+        inputs_embeds_generated = self.opt_model_clone.get_input_embeddings()(generated_tokens.input_ids)
+        inputs_embeds_generated = torch.cat((prompt_embeds, inputs_embeds_generated), dim=1)
+        attention_mask_generated = torch.cat([prompt_tokens.attention_mask, generated_tokens.attention_mask], dim=1)
+        
+        outputs_real = self.opt_model_clone(
+            inputs_embeds=inputs_embeds_real,
+            attention_mask=attention_mask_real,
+            return_dict=True,
+            labels=targets_real,
+        )
+        outputs_generated = self.opt_model_clone(
+            inputs_embeds=inputs_embeds_generated,
+            attention_mask=attention_mask_generated,
+            return_dict=True,
+            labels=targets_generated,
+        )
+
+        real_logits = outputs_real.logits
+        generated_logits = outputs_generated.logits
+
+        real_logps = self._get_batch_logps(
+            real_logits[:, :-1, :],
+            targets_real[:, 1:],
+            average_log_prob=False,
+        )
+        generated_logps = self._get_batch_logps(
+            generated_logits[:, :-1, :],
+            targets_generated[:, 1:],
+            average_log_prob=False,
+        )
+
+        return real_logps, generated_logps
+    
+    def _get_batch_logps(self, logits: torch.FloatTensor, labels, average_log_prob: bool = False) ->  torch.FloatTensor:
+        logits = logits.contiguous()
+        labels = labels.contiguous()
+        loss_fn = CrossEntropyLoss(reduction='none')
+        loss_per_token = loss_fn(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1)
+        )
+        loss_per_token = loss_per_token.view(labels.size())
+
+        # padding_mask = (labels != -100)
+        # valid_token_count = padding_mask.sum()
+        loss_per_sequence = loss_per_token.sum(dim=1)
+        # loss_per_sequence_mean = loss_per_sequence / valid_token_count
+
+        return -loss_per_sequence
+    
+    def forward(self, batch):
+        (
+            policy_real_logps,
+            policy_generated_logps,
+        ) = self.get_now_forward(batch)
+        (
+            opponent_real_logps,
+            opponent_generated_logps,
+        ) = self.get_before_forward(batch)
+
+        pi_logratios = policy_real_logps - policy_generated_logps
+        ref_logratios = opponent_real_logps - opponent_generated_logps
+        logits = pi_logratios - ref_logratios
+        # logits = self.beta * logits
+        # losses = torch.clamp(1 - logits, min=0)
+        losses = (
+            - F.logsigmoid(self.beta * logits) * (1 - self.label_smoothing)
+            + F.logsigmoid(-self.beta * logits) * self.label_smoothing
+        ) / (1 - 2 * self.label_smoothing)
+
+        return {"loss": losses.mean()}
+    
+    # def forward(self, batch):
+    #     loss = self._get_batch_metrics(batch)
+    #     return {"loss": loss}
 
     def forward_reaction(self, batch):
         reaction_tokens, notes_tokens, graphs = batch
@@ -695,4 +929,3 @@ class Blip2OPT(Blip2Base):
                     print(predict)
                     print(text)
             return knn_decode_strings
-            

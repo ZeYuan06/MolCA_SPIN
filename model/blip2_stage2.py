@@ -1,5 +1,5 @@
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Literal
 import torch
 from model.blip2_opt import Blip2OPT
 from model.blip2_llama import Blip2Llama
@@ -85,6 +85,9 @@ class Blip2Stage2(pl.LightningModule):
         self.tokenizer = self.blip2opt.init_tokenizer()
         self.save_hyperparameters(args)
 
+    def clone_model(self):
+        self.blip2opt.clone_model()
+        
     def load_from_stage1_checkpoint(self, path):
         ckpt = torch.load(path, map_location='cpu')
         state_dict = ckpt['state_dict']
@@ -197,8 +200,8 @@ class Blip2Stage2(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx, dataloader_idx):
         if dataloader_idx == 0:
-            _, _, text_tokens = batch
-            batch_size = text_tokens.input_ids.shape[0]
+            _, _, _, generated_tokens = batch
+            batch_size = generated_tokens.input_ids.shape[0]
             loss = self.blip2opt(batch)
             ###============== Overall Loss ===================###
             self.log("val molecule loss", float(loss['loss']), batch_size=batch_size, sync_dist=True)
@@ -270,26 +273,26 @@ class Blip2Stage2(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         if self.scheduler:
             self.scheduler.step(self.trainer.current_epoch, self.trainer.global_step)
-        if isinstance(batch, list) and len(batch) == 2:
-            molecule_batch, reaction_batch = batch
-            batch_size = molecule_batch[-1].size(0)
-            ###============== molecule Loss ===================###
-            molecule_loss = self.blip2opt(molecule_batch)['loss']
-            self.log("molecule loss", float(molecule_loss), batch_size=batch_size, sync_dist=True)
+        # if isinstance(batch, list) and len(batch) == 2:
+            # molecule_batch, reaction_batch = batch
+            # batch_size = molecule_batch[-1].size(0)
+            # ###============== molecule Loss ===================###
+            # molecule_loss = self.blip2opt(molecule_batch)['loss']
+            # self.log("molecule loss", float(molecule_loss), batch_size=batch_size, sync_dist=True)
             
-            ###============== reaction Loss ===================###
-            reaction_loss = self.blip2opt.forward_reaction(reaction_batch)['loss']
-            self.log("reaction loss", float(reaction_loss), batch_size=batch_size, sync_dist=True)
+            # ###============== reaction Loss ===================###
+            # reaction_loss = self.blip2opt.forward_reaction(reaction_batch)['loss']
+            # self.log("reaction loss", float(reaction_loss), batch_size=batch_size, sync_dist=True)
 
-            self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
-            return molecule_loss + self.reaction_weight * reaction_loss
-        else:
-            batch_size = batch[-1].input_ids.size(0)
-            ###============== Overall Loss ===================###
-            loss = self.blip2opt(batch)
-            self.log("molecule loss", float(loss['loss']), batch_size=batch_size, sync_dist=True)
-            self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
-            return loss['loss']
+            # self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
+            # return molecule_loss + self.reaction_weight * reaction_loss
+        # else:
+        batch_size = batch[-1].input_ids.size(0)
+        ###============== Overall Loss ===================###
+        loss = self.blip2opt(batch)
+        self.log("molecule loss", float(loss['loss']), batch_size=batch_size, sync_dist=True)
+        self.log("lr", self.trainer.optimizers[0].param_groups[0]['lr'], batch_size=batch_size, sync_dist=True)
+        return loss['loss']
 
     @staticmethod
     def add_model_specific_args(parent_parser):
@@ -339,6 +342,8 @@ class Blip2Stage2(pl.LightningModule):
         parser.add_argument('--stage2_path', type=str, default='')
         parser.add_argument('--init_checkpoint', type=str, default='')
         parser.add_argument('--caption_eval_epoch', type=int, default=10)
+        parser.add_argument('--beta', type=float, default=0.1)
+        # parser.add_argument('--loss_type', type=Literal["sigmoid", "hinge"], default = "sigmoid")
         return parent_parser
 
 

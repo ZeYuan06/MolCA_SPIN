@@ -10,6 +10,7 @@ from data_provider.stage2_dm import Stage2DM
 from data_provider.iupac_dm import IupacDM
 from data_provider.stage2_chebi_dm import Stage2CheBIDM
 from model.blip2_stage2 import Blip2Stage2
+from MyDDPStrategy import MyDDPStrategy
 
 # torch.set_default_dtype(torch.float16)
 
@@ -25,10 +26,10 @@ torch.set_float32_matmul_precision('medium') # can be medium (bfloat16), high (t
 #         assert self.lightning_module is not None
 #         self.lightning_module.load_state_dict(checkpoint["state_dict"], strict=False)
 
-class MyDDPStrategy(strategies.DDPStrategy):
-    def load_model_state_dict(self, checkpoint):
-        assert self.lightning_module is not None
-        self.lightning_module.load_state_dict(checkpoint["state_dict"], strict=False)
+# class MyDDPStrategy(strategies.DDPStrategy):
+#     def load_model_state_dict(self, checkpoint):
+#         assert self.lightning_module is not None
+#         self.lightning_module.load_state_dict(checkpoint["state_dict"], strict=False)
 
 def main(args):
     pl.seed_everything(args.seed)
@@ -47,7 +48,6 @@ def main(args):
         print(f"loaded stage1 model from {args.stage1_path}")
     else:
         model = Blip2Stage2(args)
-
     print('total params:', sum(p.numel() for p in model.parameters()))
 
     if args.opt_model.find('galactica') >= 0 or args.opt_model.find('t5') >= 0:
@@ -56,6 +56,7 @@ def main(args):
         tokenizer = model.blip2opt.llm_tokenizer
     else:
         raise NotImplementedError
+    model.clone_model()
     # data
     if args.iupac_prediction:
         dm = IupacDM(args.mode, args.num_workers, args.batch_size, args.root, args.text_max_len, tokenizer, args)

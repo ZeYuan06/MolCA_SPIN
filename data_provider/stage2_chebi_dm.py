@@ -10,6 +10,7 @@ from torch_geometric.loader.dataloader import Collater
 import re
 from ogb.utils import smiles2graph
 from rdkit import RDLogger
+import traceback
 RDLogger.DisableLog('rdApp.*')
 
 # we split individual characters inside special tokens like [START_DNA]
@@ -79,7 +80,7 @@ class TrainCollater:
         self.is_gal = is_gal
         
     def __call__(self, batch):
-        graphs, texts, smiles_prompt = zip(*batch)
+        graphs, real, generated, smiles_prompt = zip(*batch)
         graphs = self.collater(graphs)
         
         ## deal with prompt
@@ -104,14 +105,22 @@ class TrainCollater:
         # print(smiles_prompt_tokens.input_ids, self.mol_token_id)
         # print(is_mol_token)
         self.tokenizer.paddding_side = 'right'
-        text_tokens = self.tokenizer(text=texts,
+        real_text_tokens = self.tokenizer(text=real,
                                      truncation=True,
                                      padding='longest',
                                      add_special_tokens=True,
                                      max_length=self.text_max_len,
                                      return_tensors='pt',
                                      return_attention_mask=True)
-        return graphs, smiles_prompt_tokens, text_tokens
+        
+        generated_text_tokens = self.tokenizer(text = generated,
+                                               truncation = True,
+                                               padding = 'longest',
+                                               max_length=self.text_max_len,
+                                               return_tensors='pt',
+                                               return_attention_mask=True
+                                               )
+        return graphs, smiles_prompt_tokens, real_text_tokens, generated_text_tokens
 
     
 
@@ -171,6 +180,7 @@ class CheBIDataset(Dataset):
             _, smiles, text = line.split('\t')
             self.smiles_list.append(smiles)
             self.text_list.append(text)
+        f.close()
 
     def __len__(self):
         return len(self.smiles_list)
@@ -185,6 +195,46 @@ class CheBIDataset(Dataset):
         else:
             smiles_prompt = self.prompt
         return graph, text, smiles_prompt
+    
+class CheBIDataset_Train(Dataset):
+    def __init__(self, path, text_max_len, prompt=None):
+        self.path = path
+        self.text_max_len = text_max_len
+        self.prompt = prompt
+
+        if not prompt:
+            self.prompt = 'The SMILES of this molecule is [START_I_SMILES]{}[END_I_SMILES]. '
+        else:
+            self.prompt = prompt
+
+        with open(self.path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            lines = [line.strip() for line in lines][1:]
+        
+        self.smiles_list = []
+        self.real_list = []
+        self.generated_list = []
+        for line in lines:
+            _, smiles, real, generated = line.split('\t')
+            self.smiles_list.append(smiles)
+            self.real_list.append(real)
+            self.generated_list.append(generated)
+        f.close()
+
+    def __len__(self):
+        return len(self.smiles_list)
+    
+    def __getitem__(self, index):
+        smiles = self.smiles_list[index]
+        real = self.real_list[index]
+        generated = self.generated_list[index]
+        graph = smiles2data(smiles)
+
+        if self.prompt.find('{}') >= 0:
+            smiles_prompt = self.prompt.format(smiles[:128])
+        else:
+            smiles_prompt = self.prompt
+        return graph, real, generated, smiles_prompt
 
 
 class Stage2CheBIDM(LightningDataModule):
@@ -206,8 +256,8 @@ class Stage2CheBIDM(LightningDataModule):
         self.num_workers = num_workers
         self.text_max_len = text_max_len
         self.prompt = args.prompt
-        self.train_dataset = CheBIDataset(root+f'/train.txt', text_max_len, self.prompt)
-        self.val_dataset = CheBIDataset(root + '/validation.txt', text_max_len, self.prompt)
+        self.train_dataset = CheBIDataset_Train(root+f'/train_convert.txt', text_max_len, self.prompt)
+        self.val_dataset = CheBIDataset_Train(root + '/validation_convert.txt', text_max_len, self.prompt)
         self.test_dataset = CheBIDataset(root + '/test.txt', text_max_len, self.prompt)
         self.init_tokenizer(tokenizer)
         self.mol_ph_token = '<mol>' * self.args.num_query_token

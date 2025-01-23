@@ -7,3 +7,5 @@ log*
 .d*
 llms
 Text2graph
+log/
+all_checkpoints/

@@ -168,7 +168,7 @@ class Stage2DM(LightningDataModule):
             self.pretrain_dataset = MoleculeCaptionV2(root+f'pretrain.pt', text_max_len, self.prompt)
             self.train_dataset = MoleculeCaptionV2(root+f'train.pt', text_max_len, self.prompt)
             self.val_dataset = MoleculeCaptionV2(root + f'valid.pt', text_max_len, self.prompt)
-            self.test_dataset = MoleculeCaptionV2(root + f'test.pt', text_max_len, self.prompt)
+            self.test_dataset = MoleculeCaptionV2(root + f'train.pt', text_max_len, self.prompt)
         self.init_tokenizer(tokenizer)
         self.mol_ph_token = '<mol>' * self.args.num_query_token
         self.is_gal = args.opt_model.find('galactica') >= 0
